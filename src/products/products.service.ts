@@ -6,11 +6,12 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { PaginationDto } from 'src/common/dto/pagination.dto';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { Product } from './entities/product.entity';
 import { validate as isUUID } from 'uuid';
+import { ProductImage } from './entities';
 
 @Injectable()
 export class ProductsService {
@@ -18,11 +19,21 @@ export class ProductsService {
   constructor(
     @InjectRepository(Product)
     private readonly productRepository: Repository<Product>,
+    @InjectRepository(ProductImage)
+    private readonly productImageRepository: Repository<ProductImage>,
+
+    private readonly dataSource: DataSource,
   ) {}
 
   async create(createProductDto: CreateProductDto) {
+    const { images = [], ...productDetails } = createProductDto;
     try {
-      const product = this.productRepository.create(createProductDto);
+      const product = this.productRepository.create({
+        ...productDetails,
+        images: images.map((img) =>
+          this.productImageRepository.create({ url: img }),
+        ),
+      });
 
       await this.productRepository.save(product);
 
@@ -37,6 +48,9 @@ export class ProductsService {
     const query = await this.productRepository.find({
       take: limit,
       skip: offset,
+      relations: {
+        images: true,
+      },
     });
     return query;
   }
@@ -46,12 +60,13 @@ export class ProductsService {
     if (isUUID(id))
       product = await this.productRepository.findOneBy({ id: id });
     else {
-      const queryBuilder = this.productRepository.createQueryBuilder();
+      const queryBuilder = this.productRepository.createQueryBuilder('prod');
       product = await queryBuilder
         .where(`LOWER(title) =:title or LOWER(slug) =:slug`, {
           title: id.toLowerCase(),
           slug: id.toLowerCase(),
         })
+        .leftJoinAndSelect('prod.images', 'prodImages')
         .getOne();
     }
 
@@ -62,14 +77,42 @@ export class ProductsService {
 
   async update(id: string, updateProductDto: UpdateProductDto) {
     if (!isUUID(id)) throw new BadRequestException('invalid product id');
-    const query = await this.productRepository.preload({
+
+    const { images, ...toUpdate } = updateProductDto;
+
+    const product = await this.productRepository.preload({
       id: id,
-      ...updateProductDto,
+      ...toUpdate,
     });
-    if (!query)
+    if (!product)
       throw new BadRequestException('The requested product doesnt exist');
 
-    return await this.productRepository.save(query);
+    //create query runner
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      if (images) {
+        //delete old images
+        await queryRunner.manager.delete(ProductImage, {
+          product: { id },
+        });
+        //push new images
+        product.images = images.map((img) =>
+          this.productImageRepository.create({ url: img }),
+        );
+      }
+
+      await queryRunner.manager.save(product);
+      await queryRunner.commitTransaction();
+      await queryRunner.release();
+
+      return this.findOne(id);
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      await queryRunner.release();
+      this.handleExceptions(error);
+    }
   }
 
   async remove(id: string) {
@@ -77,6 +120,15 @@ export class ProductsService {
       const query = await this.productRepository.findOneBy({ id: id });
       await this.productRepository.remove(query);
       return { message: `The product ${id} has been deleted` };
+    } catch (error) {
+      this.handleExceptions(error);
+    }
+  }
+
+  async deleteAllProducts() {
+    const query = this.productRepository.createQueryBuilder('product');
+    try {
+      return await query.delete().where({}).execute();
     } catch (error) {
       this.handleExceptions(error);
     }
